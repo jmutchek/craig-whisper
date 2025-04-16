@@ -120,7 +120,9 @@ function Get-PlayerName {
         [string]$FileName
     )
     
-    if ($FileName -match "^\d+-([^_]+)_+\d+") {
+    # Try to match the expected pattern with a number, player name, and another number
+    # Pattern now matches filenames like "6-sarahgm__0" where there can be multiple underscores
+    if ($FileName -match "^\d+-([^_]+)(?:_+)\d+") {
         return $Matches[1]
     }
     
@@ -658,6 +660,75 @@ function Create-ConsolidatedTranscript {
         return $false
     }
 }
+
+function Create-MarkdownTranscript {
+    param (
+        [string]$ConsolidatedTranscriptPath,
+        [string]$OutputFolder
+    )
+    
+    Write-Log "Creating markdown transcript from consolidated transcript" "INFO"
+    
+    if (-not (Test-Path $ConsolidatedTranscriptPath)) {
+        Write-Log "Consolidated transcript file not found: $ConsolidatedTranscriptPath" "ERROR"
+        return $false
+    }
+    
+    try {
+        # Read the consolidated transcript file
+        $transcriptContent = Get-Content -Path $ConsolidatedTranscriptPath -Encoding UTF8
+        
+        # Skip header and get content lines
+        $contentLines = $transcriptContent | Where-Object { 
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch "^speaker\t"
+        }
+        
+        # Parse content into objects for easier manipulation
+        $transcriptEntries = @()
+        foreach ($line in $contentLines) {
+            $parts = $line -split "`t"
+            
+            # Skip lines with fewer than expected columns
+            if ($parts.Count -lt 4) {
+                continue
+            }
+            
+            # Convert milliseconds to formatted time
+            $startMs = [int]::Parse($parts[1])
+            $startTimeSpan = [TimeSpan]::FromMilliseconds($startMs)
+            $formattedTime = "{0:hh\:mm\:ss}" -f $startTimeSpan
+            
+            $transcriptEntries += [PSCustomObject]@{
+                Speaker = $parts[0]
+                FormattedTime = $formattedTime
+                Text = $parts[3]
+            }
+        }
+        
+        # Create markdown content
+        $markdownLines = New-Object System.Collections.ArrayList
+        
+        foreach ($entry in $transcriptEntries) {
+            # Format: **[00:00:00] Speaker:**  
+            # Text content
+            [void]$markdownLines.Add("**[$($entry.FormattedTime)] $($entry.Speaker):**  ")
+            [void]$markdownLines.Add("$($entry.Text)")
+            [void]$markdownLines.Add("") # Empty line for spacing
+        }
+        
+        # Write to markdown file
+        $markdownFile = Join-Path $OutputFolder "transcript.md"
+        $markdownLines | Out-File -FilePath $markdownFile -Encoding UTF8
+        
+        $entryCount = $transcriptEntries.Count
+        Write-Log "Created markdown transcript with $entryCount entries: $markdownFile" "INFO"
+        return $true
+    }
+    catch {
+        Write-Log "Error creating markdown transcript: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
 #endregion
 
 #region Main Script
@@ -849,6 +920,20 @@ if ($aggregateResult) {
         
         if ($consolidatedResult) {
             Write-Log "Successfully created consolidated transcript" "INFO"
+            
+            # Now create the markdown transcript from the consolidated transcript
+            $consolidatedTranscriptFile = Join-Path $OutputFolder "consolidated_transcript.tsv"
+            if (Test-Path $consolidatedTranscriptFile) {
+                $markdownResult = Create-MarkdownTranscript -ConsolidatedTranscriptPath $consolidatedTranscriptFile -OutputFolder $OutputFolder
+                
+                if ($markdownResult) {
+                    Write-Log "Successfully created markdown transcript" "INFO"
+                } else {
+                    Write-Log "Failed to create markdown transcript" "WARNING"
+                }
+            } else {
+                Write-Log "Consolidated transcript file not found, cannot create markdown version" "WARNING"
+            }
         } else {
             Write-Log "Failed to create consolidated transcript" "WARNING"
         }
