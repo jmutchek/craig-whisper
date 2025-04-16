@@ -25,6 +25,8 @@
 #  - statistics are collected about duration, file sizes, and processing time
 #  - output format:
 #    - individual TSV files for each transcription with speaker, start time, end time, and text
+#    - original whisper files are stored in the archive directory
+#    - processed files are stored in the temp directory
 #  - the -Force parameter can be used to override CSV column mismatches when appending errors
 #  - the -PostProcessOnly parameter can be used to skip transcription and only run the post-processing
 #  - the -Cleanup parameter can be used to remove temporary files after processing
@@ -156,9 +158,11 @@ function Transcribe-AudioFile {
             throw "Expected transcript file not found: $originalTsvFile"
         }
         
-        # Create a copy with a clear name to distinguish original whisper output
-        $originalWhisperOutput = Join-Path $TempOutputDir "$baseFileName.whisper_original.tsv"
+        # Create a copy in the archive directory to preserve original whisper output
+        $originalWhisperOutput = Join-Path $archiveDir "$baseFileName.whisper_original.tsv"
         Copy-Item -Path $originalTsvFile -Destination $originalWhisperOutput
+        
+        Write-Log "Original Whisper output archived at: $originalWhisperOutput" "INFO"
         
         # Add the player name to each line in the transcription
         $transcriptContent = Get-Content $originalTsvFile -Encoding UTF8
@@ -179,13 +183,9 @@ function Transcribe-AudioFile {
             }
         }
         
-        # Save processed transcript to temp directory first
-        $processedTempFile = Join-Path $TempOutputDir "$baseFileName.processed.tsv"
-        $updatedContent | Out-File -FilePath $processedTempFile -Encoding UTF8
-        
-        # Copy to output folder for final access
-        $updatedFilePath = Join-Path $OutputFolder "$baseFileName.processed.tsv"
-        Copy-Item -Path $processedTempFile -Destination $updatedFilePath
+        # Save processed transcript to temp directory only
+        $processedFile = Join-Path $TempOutputDir "$baseFileName.processed.tsv"
+        $updatedContent | Out-File -FilePath $processedFile -Encoding UTF8
         
         # Calculate processing time and stats
         $endTime = Get-Date
@@ -245,6 +245,13 @@ function Process-WhisperFile {
     try {
         # Read the original whisper output file
         $transcriptContent = Get-Content -Path $WhisperFile -Encoding UTF8
+        
+        # Create a copy in the archive directory to preserve original whisper output
+        $originalWhisperOutput = Join-Path $archiveDir "$baseFileName.whisper_original.tsv"
+        Copy-Item -Path $WhisperFile -Destination $originalWhisperOutput
+        
+        Write-Log "Original Whisper output archived at: $originalWhisperOutput" "INFO"
+        
         $processedLines = New-Object System.Collections.ArrayList
         
         # Add header line
@@ -347,15 +354,11 @@ function Process-WhisperFile {
             [void]$processedLines.Add("$($line.Speaker)`t$($line.Start)`t$($line.End)`t$($line.Text)")
         }
         
-        # Save processed transcript to temp directory first
-        $processedTempFile = Join-Path $TempOutputDir "$baseFileName.processed.tsv"
-        $processedLines | Out-File -FilePath $processedTempFile -Encoding UTF8
+        # Save processed transcript directly to the temp directory only
+        $processedFile = Join-Path $TempOutputDir "$baseFileName.processed.tsv"
+        $processedLines | Out-File -FilePath $processedFile -Encoding UTF8
         
-        # Copy to output folder for final access
-        $updatedFilePath = Join-Path $OutputFolder "$baseFileName.processed.tsv"
-        Copy-Item -Path $processedTempFile -Destination $updatedFilePath
-        
-        Write-Log "Created processed file: $updatedFilePath (processed $($contentLines.Count) lines, collapsed $collapsedCount, filtered $filteredCount)" "INFO"
+        Write-Log "Created processed file: $processedFile (processed $($contentLines.Count) lines, collapsed $collapsedCount, filtered $filteredCount)" "INFO"
         return $true
     }
     catch {
@@ -440,10 +443,15 @@ if (-not (Test-Path $OutputFolder)) {
 $logFilePath = Join-Path $OutputFolder "transcription_log.csv"
 $stateFilePath = Join-Path $OutputFolder "transcription_state.csv"
 $tempOutputDir = Join-Path $OutputFolder "temp"
+$archiveDir = Join-Path $OutputFolder "archive"
 
-# Create temp directory if it doesn't exist
+# Create temp and archive directories if they don't exist
 if (-not (Test-Path $tempOutputDir)) {
     New-Item -Path $tempOutputDir -ItemType Directory | Out-Null
+}
+
+if (-not (Test-Path $archiveDir)) {
+    New-Item -Path $archiveDir -ItemType Directory | Out-Null
 }
 
 # Initialize log file if it doesn't exist
@@ -515,23 +523,36 @@ if (-not $PostProcessOnly) {
     Write-Log "Running in post-process only mode - skipping transcription" "INFO"
     
     # Clean up any existing processed files first to avoid duplication
-    $existingProcessedFiles = Get-ChildItem -Path $OutputFolder -Filter "*.processed.tsv" -ErrorAction SilentlyContinue
+    $existingProcessedFiles = Get-ChildItem -Path $tempOutputDir -Filter "*.processed.tsv" -ErrorAction SilentlyContinue
     if ($existingProcessedFiles.Count -gt 0) {
         Write-Log "Removing $($existingProcessedFiles.Count) existing processed files before recreating them" "INFO"
         $existingProcessedFiles | Remove-Item -Force
     }
     
-    # Check if there are any whisper transcript files in the temp directory
-    # Explicitly exclude backup/original files and already processed files
-    $whisperFiles = Get-ChildItem -Path $tempOutputDir -Filter "*.tsv" -ErrorAction SilentlyContinue | 
-                    Where-Object { 
-                        $_.Name -notmatch "\.processed\.tsv$" -and 
-                        $_.Name -notmatch "\.whisper_original\.tsv$" 
-                    }
+    # Check if there are any whisper transcript files in BOTH the temp AND archive directories
+    $whisperFilesTmp = Get-ChildItem -Path $tempOutputDir -Filter "*.tsv" -ErrorAction SilentlyContinue | 
+                      Where-Object { 
+                          $_.Name -notmatch "\.processed\.tsv$" -and 
+                          $_.Name -notmatch "\.whisper_original\.tsv$" 
+                      }
+    
+    $whisperFilesArchive = Get-ChildItem -Path $archiveDir -Filter "*.whisper_original.tsv" -ErrorAction SilentlyContinue
+    
+    $whisperFiles = @()
+    
+    # Add files from temp directory if any
+    if ($whisperFilesTmp.Count -gt 0) {
+        $whisperFiles += $whisperFilesTmp
+    }
+    
+    # Add files from archive directory if any
+    if ($whisperFilesArchive.Count -gt 0) {
+        $whisperFiles += $whisperFilesArchive
+    }
     
     if ($whisperFiles.Count -eq 0) {
-        Write-Log "No Whisper transcription files found in temp directory: $tempOutputDir" "WARNING"
-        Write-Host "No Whisper transcription files found to post-process in: $tempOutputDir" -ForegroundColor Yellow
+        Write-Log "No Whisper transcription files found in temp or archive directories" "WARNING"
+        Write-Host "No Whisper transcription files found to post-process in: $tempOutputDir or $archiveDir" -ForegroundColor Yellow
         exit 0
     }
     
@@ -552,11 +573,11 @@ if (-not $PostProcessOnly) {
     }
     
     # Check if any processed files were created
-    $transcriptFiles = Get-ChildItem -Path $OutputFolder -Filter "*.processed.tsv" -ErrorAction SilentlyContinue
+    $transcriptFiles = Get-ChildItem -Path $tempOutputDir -Filter "*.processed.tsv" -ErrorAction SilentlyContinue
     
     if ($transcriptFiles.Count -eq 0) {
-        Write-Log "No processed transcript files were created in output folder: $OutputFolder" "WARNING"
-        Write-Host "Failed to create any processed transcript files in: $OutputFolder" -ForegroundColor Yellow
+        Write-Log "No processed transcript files were created in temp directory: $tempOutputDir" "WARNING"
+        Write-Host "Failed to create any processed transcript files in: $tempOutputDir" -ForegroundColor Yellow
         exit 0
     }
     
