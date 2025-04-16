@@ -8,6 +8,7 @@
 #  - force          - switch parameter to force re-transcription of already processed files
 #  - postProcessOnly - switch parameter to skip transcription and only perform post-processing
 #  - cleanup        - switch parameter to remove temporary files after processing; if not provided, temp files are kept
+#  - ignoreWords    - array of words/phrases to be filtered out from transcriptions (case-insensitive)
 # 
 # Requirements
 #  - intended to be run unattended on a Windows machine with Python and whisper installed
@@ -27,6 +28,7 @@
 #  - the -Force parameter can be used to override CSV column mismatches when appending errors
 #  - the -PostProcessOnly parameter can be used to skip transcription and only run the post-processing
 #  - the -Cleanup parameter can be used to remove temporary files after processing
+#  - the -IgnoreWords parameter can be used to specify words to filter out from transcriptions
 #
 # Usage examples:
 #  - .\transcribe.ps1 -InputFolder "C:\path\to\audio\files"
@@ -34,6 +36,7 @@
 #  - .\transcribe.ps1 -InputFolder "C:\path\to\audio\files" -Force
 #  - .\transcribe.ps1 -InputFolder "C:\path\to\audio\files" -PostProcessOnly
 #  - .\transcribe.ps1 -InputFolder "C:\path\to\audio\files" -Cleanup
+#  - .\transcribe.ps1 -InputFolder "C:\path\to\audio\files" -IgnoreWords @("you", "um", "uh")
 #
 # Examples
 #  - This is an example of the transcription output file:
@@ -66,7 +69,10 @@ param (
     [switch]$PostProcessOnly = $false,
     
     [Parameter(Mandatory=$false, HelpMessage="Clean up temporary files after processing")]
-    [switch]$Cleanup = $false
+    [switch]$Cleanup = $false,
+    
+    [Parameter(Mandatory=$false, HelpMessage="Words or phrases to be filtered out from transcriptions (case-insensitive)")]
+    [string[]]$IgnoreWords = @("you", "silence", "um", "uh", "ah", "like", "right", "well")
 )
 
 #region Functions
@@ -239,32 +245,117 @@ function Process-WhisperFile {
     try {
         # Read the original whisper output file
         $transcriptContent = Get-Content -Path $WhisperFile -Encoding UTF8
-        $updatedContent = @()
+        $processedLines = New-Object System.Collections.ArrayList
+        
+        # Add header line
+        $headerLine = ($transcriptContent | Where-Object { $_ -match "^start" } | Select-Object -First 1)
+        if ($headerLine) {
+            [void]$processedLines.Add("speaker`t$headerLine")
+        } else {
+            [void]$processedLines.Add("speaker`tstart`tend`ttext") # Default header if none found
+        }
+        
+        # Process content lines and store as objects for easier manipulation
+        $contentLines = @()
+        $filteredCount = 0
         
         foreach ($line in $transcriptContent) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+            
             if ($line -match "^start") {
-                # Update header line to include speaker column
-                $updatedContent += "speaker`t$line"
+                # Skip header line as we've already added it
+                continue
             }
-            elseif ([string]::IsNullOrWhiteSpace($line)) {
-                # Keep empty lines unchanged
-                $updatedContent += $line
+            
+            # Extract the text portion and other fields
+            $lineParts = $line -split '\t'
+            
+            # Skip lines with fewer than expected columns
+            if ($lineParts.Count -lt 3) {
+                continue
             }
-            else {
-                # Add playername as first column
-                $updatedContent += "$playerName`t$line"
+            
+            $startTime = $lineParts[0]
+            $endTime = $lineParts[1]
+            $text = $lineParts[2].Trim()
+            
+            # Check if the text matches any of the ignore words/phrases (with or without punctuation)
+            $shouldFilter = $false
+            foreach ($ignoreWord in $IgnoreWords) {
+                # Check for exact match or match with trailing punctuation
+                if ($text -ieq $ignoreWord -or $text -imatch "^$([regex]::Escape($ignoreWord))[.,!?;:]?$") {
+                    $shouldFilter = $true
+                    $filteredCount++
+                    break
+                }
             }
+            
+            if (-not $shouldFilter) {
+                $contentLines += [PSCustomObject]@{
+                    Speaker = $playerName
+                    Start = $startTime
+                    End = $endTime
+                    Text = $text
+                }
+            }
+        }
+        
+        # Collapse consecutive identical lines
+        $collapsedLines = New-Object System.Collections.ArrayList
+        $collapsedCount = 0
+        
+        if ($contentLines.Count -gt 0) {
+            # Initialize with the first item
+            $currentGroup = [PSCustomObject]@{
+                Speaker = $contentLines[0].Speaker
+                Start = $contentLines[0].Start
+                End = $contentLines[0].End
+                Text = $contentLines[0].Text
+            }
+            
+            # Process the remaining items starting from the second item
+            for ($i = 1; $i -lt $contentLines.Count; $i++) {
+                $current = $contentLines[$i]
+                
+                # Check if the current line has the same speaker and text as the current group (case-insensitive comparison)
+                if ($current.Speaker -eq $currentGroup.Speaker -and $current.Text -ieq $currentGroup.Text) {
+                    # Update the end timestamp of the current group to the latest end time
+                    $currentGroup.End = $current.End
+                    $collapsedCount++
+                } else {
+                    # Add the current group to our collapsed results
+                    [void]$collapsedLines.Add($currentGroup)
+                    
+                    # Start a new group with the current item
+                    $currentGroup = [PSCustomObject]@{
+                        Speaker = $current.Speaker
+                        Start = $current.Start
+                        End = $current.End
+                        Text = $current.Text
+                    }
+                }
+            }
+            
+            # Add the last group
+            [void]$collapsedLines.Add($currentGroup)
+        }
+        
+        # Convert collapsed lines back to TSV format and add to processed lines
+        foreach ($line in $collapsedLines) {
+            [void]$processedLines.Add("$($line.Speaker)`t$($line.Start)`t$($line.End)`t$($line.Text)")
         }
         
         # Save processed transcript to temp directory first
         $processedTempFile = Join-Path $TempOutputDir "$baseFileName.processed.tsv"
-        $updatedContent | Out-File -FilePath $processedTempFile -Encoding UTF8
+        $processedLines | Out-File -FilePath $processedTempFile -Encoding UTF8
         
         # Copy to output folder for final access
         $updatedFilePath = Join-Path $OutputFolder "$baseFileName.processed.tsv"
         Copy-Item -Path $processedTempFile -Destination $updatedFilePath
         
-        Write-Log "Created processed file: $updatedFilePath" "INFO"
+        Write-Log "Created processed file: $updatedFilePath (processed $($contentLines.Count) lines, collapsed $collapsedCount, filtered $filteredCount)" "INFO"
         return $true
     }
     catch {
@@ -372,6 +463,7 @@ Write-Log "Output folder: $OutputFolder" "INFO"
 Write-Log "Force re-transcription: $Force" "INFO"
 Write-Log "Post-process only: $PostProcessOnly" "INFO"
 Write-Log "Cleanup temp folder: $Cleanup" "INFO"
+Write-Log "Words to ignore: $($IgnoreWords -join ', ')" "INFO"
 
 # Check for dependencies
 if (-not $PostProcessOnly) {
