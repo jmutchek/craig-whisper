@@ -1,5 +1,6 @@
 # A PowerShell script to automate the transcription of audio files.
 # Uses OpenAI's whisper implementation and Python
+# This script was written with support from GitHub Copilot and ChatGPT
 #
 # Parameters
 #  - inputFolder    - folder that contains all of the audio files to be transcribed
