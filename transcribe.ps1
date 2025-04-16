@@ -238,7 +238,15 @@ function Process-WhisperFile {
     
     $fileName = [System.IO.Path]::GetFileName($WhisperFile)
     $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-    $playerName = Get-PlayerName -FileName $baseFileName
+    
+    # Handle different file naming patterns based on where the file is coming from
+    # If it's already an archive file with .whisper_original.tsv extension, use the base name without that suffix
+    if ($fileName -match "\.whisper_original\.tsv$") {
+        $originalBaseFileName = $baseFileName -replace "\.whisper_original$", ""
+        $playerName = Get-PlayerName -FileName $originalBaseFileName
+    } else {
+        $playerName = Get-PlayerName -FileName $baseFileName
+    }
     
     Write-Log "Processing whisper file: $fileName for player: $playerName" "INFO"
     
@@ -246,11 +254,24 @@ function Process-WhisperFile {
         # Read the original whisper output file
         $transcriptContent = Get-Content -Path $WhisperFile -Encoding UTF8
         
-        # Create a copy in the archive directory to preserve original whisper output
+        # Create a copy in the archive directory to preserve original whisper output, but only if it doesn't already exist
         $originalWhisperOutput = Join-Path $archiveDir "$baseFileName.whisper_original.tsv"
-        Copy-Item -Path $WhisperFile -Destination $originalWhisperOutput
         
-        Write-Log "Original Whisper output archived at: $originalWhisperOutput" "INFO"
+        # If this file is already from the archive (has .whisper_original.tsv extension), 
+        # or if it's already in the archive, don't create another copy
+        if ($fileName -match "\.whisper_original\.tsv$") {
+            # File is already an archive file, use its path as the originalWhisperOutput
+            $originalWhisperOutput = $WhisperFile
+            Write-Log "Using existing archive file: $fileName" "INFO"
+        } 
+        elseif (-not (Test-Path $originalWhisperOutput)) {
+            # Only copy if the file doesn't already exist in the archive
+            Copy-Item -Path $WhisperFile -Destination $originalWhisperOutput
+            Write-Log "Original Whisper output archived at: $originalWhisperOutput" "INFO"
+        }
+        else {
+            Write-Log "Archive file already exists, skipping copy: $originalWhisperOutput" "INFO"
+        }
         
         $processedLines = New-Object System.Collections.ArrayList
         
@@ -418,6 +439,116 @@ function Get-ProcessingStats {
     }
     
     return $stats
+}
+
+function Create-AggregateTranscripts {
+    param (
+        [string]$TempOutputDir,
+        [string]$OutputFolder
+    )
+    
+    Write-Log "Starting post-post-processing: Creating aggregate transcript files" "INFO"
+    
+    # Check if there are any processed transcript files
+    $processedFiles = Get-ChildItem -Path $TempOutputDir -Filter "*.processed.tsv" -ErrorAction SilentlyContinue
+    
+    if ($processedFiles.Count -gt 0) {
+        Write-Log "Found $($processedFiles.Count) processed transcript files to aggregate" "INFO"
+        
+        try {
+            # Create a merged file sorted by start time
+            $mergedTranscriptFile = Join-Path $OutputFolder "merged_transcript.tsv"
+            $mergedLines = New-Object System.Collections.ArrayList
+            $allContentLines = @()
+            
+            # Add header only once
+            [void]$mergedLines.Add("speaker`tstart`tend`ttext")
+            
+            # Read all processed files and combine their contents
+            foreach ($file in $processedFiles) {
+                $content = Get-Content -Path $file.FullName -Encoding UTF8
+                
+                # Skip the header line of each file
+                $contentWithoutHeader = $content | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch "^speaker\t"
+                }
+                
+                if ($contentWithoutHeader.Count -gt 0) {
+                    $allContentLines += $contentWithoutHeader
+                }
+            }
+            
+            # Convert lines to objects for sorting
+            $transcriptEntries = @()
+            
+            foreach ($line in $allContentLines) {
+                $parts = $line -split "`t"
+                
+                # Skip lines with fewer than 4 parts (speaker, start, end, text)
+                if ($parts.Count -lt 4) {
+                    continue
+                }
+                
+                # Convert start time to numeric for proper sorting
+                $startTime = [int]::Parse($parts[1])
+                
+                $transcriptEntries += [PSCustomObject]@{
+                    Line = $line
+                    StartTime = $startTime
+                    Speaker = $parts[0]
+                }
+            }
+            
+            # Sort by start time
+            $sortedEntries = $transcriptEntries | Sort-Object -Property StartTime
+            
+            # Add sorted lines to the merged file
+            foreach ($entry in $sortedEntries) {
+                [void]$mergedLines.Add($entry.Line)
+            }
+            
+            # Write the merged file to the main output directory - this is the primary output
+            $mergedLines | Out-File -FilePath $mergedTranscriptFile -Encoding UTF8
+            
+            $transcriptCount = $sortedEntries.Count
+            Write-Log "Created merged transcript file with $transcriptCount entries: $mergedTranscriptFile" "INFO"
+            
+            # Create speaker-specific aggregate files in the temp directory
+            $speakers = $sortedEntries | Select-Object -ExpandProperty Speaker -Unique
+            
+            foreach ($speaker in $speakers) {
+                # Write speaker files to temp directory instead of main output
+                $speakerFile = Join-Path $TempOutputDir "$speaker`_transcript.tsv"
+                $speakerLines = New-Object System.Collections.ArrayList
+                
+                # Add header
+                [void]$speakerLines.Add("speaker`tstart`tend`ttext")
+                
+                # Get lines for this speaker
+                $speakerEntries = $sortedEntries | Where-Object { $_.Speaker -eq $speaker }
+                
+                # Add lines to speaker file
+                foreach ($entry in $speakerEntries) {
+                    [void]$speakerLines.Add($entry.Line)
+                }
+                
+                # Write the speaker file to the temp directory
+                $speakerLines | Out-File -FilePath $speakerFile -Encoding UTF8
+                
+                $entryCount = $speakerEntries.Count
+                Write-Log "Created speaker transcript file for $speaker with $entryCount entries in temp directory: $speakerFile" "INFO"
+            }
+            
+            return $true
+        }
+        catch {
+            Write-Log "Error creating aggregate transcript files: $($_.Exception.Message)" "ERROR"
+            return $false
+        }
+    } else {
+        Write-Log "No processed transcript files found to aggregate" "WARNING"
+        return $false
+    }
 }
 #endregion
 
@@ -596,6 +727,16 @@ Write-Log "Total processing time: $($stats.TotalDurationFormatted)" "INFO"
 Write-Log "Average processing time per file: $($stats.AverageDurationFormatted)" "INFO"
 Write-Log "Total audio size processed: $($stats.TotalSize) MB" "INFO"
 
+# Create aggregate transcript files
+Write-Log "Starting aggregate transcript file creation" "INFO"
+$aggregateResult = Create-AggregateTranscripts -TempOutputDir $tempOutputDir -OutputFolder $OutputFolder
+
+if ($aggregateResult) {
+    Write-Log "Successfully created aggregate transcript files in output folder" "INFO"
+} else {
+    Write-Log "No aggregate transcript files were created" "WARNING"
+}
+
 Write-Host ""
 Write-Host "Transcription Summary:" -ForegroundColor Cyan
 Write-Host "======================" -ForegroundColor Cyan
@@ -612,6 +753,26 @@ Write-Host "Average time per file: $($stats.AverageDurationFormatted)"
 Write-Host "Total audio size: $($stats.TotalSize) MB"
 Write-Host "Output folder: $OutputFolder"
 Write-Host "Individual .processed.tsv files have been created in the output folder" -ForegroundColor Cyan
+
+# Display aggregate file information
+if ($aggregateResult) {
+    Write-Host ""
+    Write-Host "Aggregate Output Files:" -ForegroundColor Cyan
+    Write-Host "----------------------" -ForegroundColor Cyan
+    Write-Host "* merged_transcript.tsv - All transcripts sorted by start time" -ForegroundColor Green
+    
+    # Look for speaker-specific files in temp directory now instead of output folder
+    $speakerFiles = Get-ChildItem -Path $TempOutputDir -Filter "*_transcript.tsv" -ErrorAction SilentlyContinue
+    
+    if ($speakerFiles.Count -gt 0) {
+        Write-Host "Speaker-specific transcript files in temp directory:" -ForegroundColor Cyan
+        foreach ($file in $speakerFiles) {
+            $speaker = [System.IO.Path]::GetFileNameWithoutExtension($file.Name).Replace("_transcript", "")
+            Write-Host "* $($file.Name) - Speaker-specific transcript for $speaker" -ForegroundColor Green
+        }
+    }
+}
+
 Write-Host ""
 
 # Clean up temp directory
