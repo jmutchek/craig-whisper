@@ -120,7 +120,7 @@ function Get-PlayerName {
         [string]$FileName
     )
     
-    if ($FileName -match "^\d+-([^_]+)_\d+") {
+    if ($FileName -match "^\d+-([^_]+)_+\d+") {
         return $Matches[1]
     }
     
@@ -550,6 +550,114 @@ function Create-AggregateTranscripts {
         return $false
     }
 }
+
+function Create-ConsolidatedTranscript {
+    param (
+        [string]$MergedTranscriptPath,
+        [string]$OutputFolder
+    )
+    
+    Write-Log "Creating consolidated transcript from merged transcript" "INFO"
+    
+    if (-not (Test-Path $MergedTranscriptPath)) {
+        Write-Log "Merged transcript file not found: $MergedTranscriptPath" "ERROR"
+        return $false
+    }
+    
+    try {
+        # Read the merged transcript file
+        $transcriptContent = Get-Content -Path $MergedTranscriptPath -Encoding UTF8
+        
+        # Extract header and content
+        $header = $transcriptContent | Where-Object { $_ -match "^speaker\t" } | Select-Object -First 1
+        $contentLines = $transcriptContent | Where-Object { 
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch "^speaker\t"
+        }
+        
+        # Parse content into objects for easier manipulation
+        $transcriptEntries = @()
+        foreach ($line in $contentLines) {
+            $parts = $line -split "`t"
+            
+            # Skip lines with fewer than expected columns
+            if ($parts.Count -lt 4) {
+                continue
+            }
+            
+            $transcriptEntries += [PSCustomObject]@{
+                Speaker = $parts[0]
+                Start = $parts[1]
+                End = $parts[2]
+                Text = $parts[3]
+            }
+        }
+        
+        # Group consecutive lines from the same speaker
+        $consolidatedEntries = New-Object System.Collections.ArrayList
+        
+        if ($transcriptEntries.Count -gt 0) {
+            $currentGroup = [PSCustomObject]@{
+                Speaker = $transcriptEntries[0].Speaker
+                Start = $transcriptEntries[0].Start
+                End = $transcriptEntries[0].End
+                Text = $transcriptEntries[0].Text
+            }
+            
+            # Process entries starting from the second one
+            for ($i = 1; $i -lt $transcriptEntries.Count; $i++) {
+                $current = $transcriptEntries[$i]
+                
+                # If same speaker as the current group, merge
+                if ($current.Speaker -eq $currentGroup.Speaker) {
+                    # Keep the original start time, update the end time
+                    $currentGroup.End = $current.End
+                    # Append the new text with a space
+                    $currentGroup.Text += " " + $current.Text
+                } else {
+                    # Add the completed group to our results
+                    [void]$consolidatedEntries.Add($currentGroup)
+                    
+                    # Start a new group
+                    $currentGroup = [PSCustomObject]@{
+                        Speaker = $current.Speaker
+                        Start = $current.Start
+                        End = $current.End
+                        Text = $current.Text
+                    }
+                }
+            }
+            
+            # Don't forget to add the last group
+            [void]$consolidatedEntries.Add($currentGroup)
+        }
+        
+        # Create the output file
+        $consolidatedTranscriptFile = Join-Path $OutputFolder "consolidated_transcript.tsv"
+        $outputLines = New-Object System.Collections.ArrayList
+        
+        # Add the header
+        [void]$outputLines.Add($header)
+        
+        # Add consolidated entries
+        foreach ($entry in $consolidatedEntries) {
+            [void]$outputLines.Add("$($entry.Speaker)`t$($entry.Start)`t$($entry.End)`t$($entry.Text)")
+        }
+        
+        # Write to file
+        $outputLines | Out-File -FilePath $consolidatedTranscriptFile -Encoding UTF8
+        
+        $entryCount = $consolidatedEntries.Count
+        $originalCount = $transcriptEntries.Count
+        $reductionPercent = [math]::Round(($originalCount - $entryCount) / $originalCount * 100, 1)
+        
+        Write-Log "Created consolidated transcript with $entryCount entries (reduced from $originalCount - $reductionPercent% reduction): $consolidatedTranscriptFile" "INFO"
+        return $true
+    }
+    catch {
+        Write-Log "Error creating consolidated transcript: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
 #endregion
 
 #region Main Script
@@ -733,6 +841,20 @@ $aggregateResult = Create-AggregateTranscripts -TempOutputDir $tempOutputDir -Ou
 
 if ($aggregateResult) {
     Write-Log "Successfully created aggregate transcript files in output folder" "INFO"
+    
+    # Now create the consolidated transcript from the merged transcript
+    $mergedTranscriptFile = Join-Path $OutputFolder "merged_transcript.tsv"
+    if (Test-Path $mergedTranscriptFile) {
+        $consolidatedResult = Create-ConsolidatedTranscript -MergedTranscriptPath $mergedTranscriptFile -OutputFolder $OutputFolder
+        
+        if ($consolidatedResult) {
+            Write-Log "Successfully created consolidated transcript" "INFO"
+        } else {
+            Write-Log "Failed to create consolidated transcript" "WARNING"
+        }
+    } else {
+        Write-Log "Merged transcript file not found, cannot create consolidated version" "WARNING"
+    }
 } else {
     Write-Log "No aggregate transcript files were created" "WARNING"
 }
@@ -760,6 +882,11 @@ if ($aggregateResult) {
     Write-Host "Aggregate Output Files:" -ForegroundColor Cyan
     Write-Host "----------------------" -ForegroundColor Cyan
     Write-Host "* merged_transcript.tsv - All transcripts sorted by start time" -ForegroundColor Green
+    
+    # Display consolidated transcript info if it was created
+    if (Test-Path (Join-Path $OutputFolder "consolidated_transcript.tsv")) {
+        Write-Host "* consolidated_transcript.tsv - Sequential lines from the same speaker merged into single entries" -ForegroundColor Green
+    }
     
     # Look for speaker-specific files in temp directory now instead of output folder
     $speakerFiles = Get-ChildItem -Path $TempOutputDir -Filter "*_transcript.tsv" -ErrorAction SilentlyContinue
